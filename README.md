@@ -1,5 +1,5 @@
 # Wave
-Shows Your Current Listening Music From Spotify
+Shows your current listening music from spotify
 
 ## Running Steps
 
