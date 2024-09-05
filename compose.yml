@@ -1,0 +1,9 @@
+services:
+  wave:
+    container_name: wave
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: always
+    volumes:
+      - ./.env:/app/.env
