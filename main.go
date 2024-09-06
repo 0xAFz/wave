@@ -57,9 +57,12 @@ func main() {
 	_ = godotenv.Load()
 
 	for {
+		time.Sleep(time.Second * 10)
+
 		song, err := getCurrentPlaying()
 		if err != nil {
 			log.Println(err)
+			continue
 		}
 
 		var artists strings.Builder
@@ -68,8 +71,6 @@ func main() {
 		}
 
 		fmt.Printf("%s - %s\n", song.Item.Name, artists.String())
-
-		time.Sleep(time.Second * 10)
 	}
 }
 
