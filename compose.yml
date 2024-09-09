@@ -1,10 +1,10 @@
 services:
   wave:
-    image: wave
-    container_name: wave
     build:
       context: .
       dockerfile: Dockerfile
+    image: wave
+    container_name: wave
     restart: always
     volumes:
       - ./.env:/.env
