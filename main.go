@@ -1,10 +1,9 @@
 package main
 
 import (
-	"bytes"
-	b64 "encoding/base64"
+	"context"
+	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -13,284 +12,364 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/joho/godotenv"
 )
 
-type Song struct {
-	Item struct {
-		Name    string `json:"name"`
-		Artists []struct {
-			Name string `json:"name"`
-		} `json:"artists"`
-	} `json:"item"`
-}
-
-type SpotifyRefreshTokenResponse struct {
-	AccessToken string `json:"access_token"`
-	TokenType   string `json:"token_type"`
-	ExpiresIn   int    `json:"expires_in"`
-	Scope       string `json:"scope"`
-}
+const (
+	spotifyAPIBase    = "https://api.spotify.com/v1"
+	spotifyTokenURL   = "https://accounts.spotify.com/api/token"
+	telegramAPIBase   = "https://api.telegram.org/bot%s/sendAudio"
+	refreshInterval   = 60 * time.Second
+	httpClientTimeout = 10 * time.Second
+	audioFileName     = "audio.mp3"
+	dataFileName      = "data.json"
+)
 
 var (
-	audioFile = "audio.mp3"
-	dataFile  = "data.json"
+	thumbnailExtensions = [2]string{".jpg", ".webp"}
+)
+
+type (
+	SpotifyClient struct {
+		clientID     string
+		clientSecret string
+		refreshToken string
+		httpClient   *http.Client
+	}
+
+	TelegramClient struct {
+		botToken   string
+		chatID     string
+		httpClient *http.Client
+	}
+
+	Track struct {
+		Name    string   `json:"name"`
+		Artists []string `json:"artists"`
+	}
+
+	SpotifyTokenResponse struct {
+		AccessToken string `json:"access_token"`
+		TokenType   string `json:"token_type"`
+		ExpiresIn   int    `json:"expires_in"`
+		Scope       string `json:"scope"`
+	}
+
+	TrackHistory map[string]bool
 )
 
 func main() {
-	_ = godotenv.Load()
-
-	upload := os.Getenv("UPLOAD")
-	chatID := os.Getenv("CHAT_ID")
-	botToken := os.Getenv("BOT_TOKEN")
-	if upload == "" || chatID == "" || botToken == "" {
-		log.Fatal("required environment variables not set")
-	}
-
-	ticker := time.NewTicker(60 * time.Second)
-	defer ticker.Stop()
-
-	for range ticker.C {
-		if err := processCurrentPlayingSong(botToken, chatID, upload); err != nil {
-			log.Println(err)
-		}
+	if err := run(); err != nil {
+		log.Fatalf("Error: %v", err)
 	}
 }
 
-func processCurrentPlayingSong(botToken, chatID, upload string) error {
-	song, err := getCurrentPlaying()
-	if err != nil {
-		return err
+func run() error {
+	if err := godotenv.Load(); err != nil {
+		return fmt.Errorf("error loading .env file: %w", err)
 	}
 
-	artists := getArtists(song.Item.Artists)
-	songKey := fmt.Sprintf("%s - %s", song.Item.Name, artists)
+	spotifyClient, err := newSpotifyClient()
+	if err != nil {
+		return fmt.Errorf("error creating Spotify client: %w", err)
+	}
 
-	log.Println(songKey)
+	telegramClient, err := newTelegramClient()
+	if err != nil {
+		return fmt.Errorf("error creating Telegram client: %w", err)
+	}
 
-	if upload == "true" {
-		dataMap, err := loadData(dataFile)
-		if err != nil {
-			return fmt.Errorf("failed to load data: %w", err)
-		}
+	history, err := loadTrackHistory(dataFileName)
+	if err != nil {
+		return fmt.Errorf("error loading track history: %w", err)
+	}
 
-		if dataMap[songKey] {
-			log.Printf("Song '%s' already exists in the database. Skipping download.", songKey)
-			return nil
-		}
+	ticker := time.NewTicker(refreshInterval)
+	defer ticker.Stop()
 
-		log.Printf("Downloading: %s", songKey)
-		if err := downloadFromYouTube(song.Item.Name, artists); err != nil {
-			return fmt.Errorf("failed to download from YouTube: %w", err)
-		}
-
-		thumbnail, err := getThumbnail(audioFile)
-		if err != nil {
-			log.Printf("failed to get thumbnail: %v", err)
-		}
-
-		log.Printf("Uploading to Telegram: %s", songKey)
-		if err := sendAudio(botToken, chatID, audioFile, song.Item.Name, artists, thumbnail); err != nil {
-			return fmt.Errorf("failed to upload to Telegram: %w", err)
-		}
-
-		dataMap[songKey] = true
-		if err := saveData(dataFile, dataMap); err != nil {
-			log.Printf("failed to save data: %v", err)
+	for range ticker.C {
+		if err := processCurrentTrack(spotifyClient, telegramClient, history); err != nil {
+			log.Printf("Error processing current track: %v", err)
 		}
 	}
 
 	return nil
 }
 
-func getArtists(artists []struct {
-	Name string `json:"name"`
-}) string {
-	names := make([]string, len(artists))
-	for i, artist := range artists {
-		names[i] = artist.Name
+func newSpotifyClient() (*SpotifyClient, error) {
+	clientID := os.Getenv("SPOTIFY_CLIENT_ID")
+	clientSecret := os.Getenv("SPOTIFY_CLIENT_SECRET")
+	refreshToken := os.Getenv("SPOTIFY_REFRESH_TOKEN")
+
+	if clientID == "" || clientSecret == "" || refreshToken == "" {
+		return nil, fmt.Errorf("missing required Spotify environment variables")
 	}
-	return strings.Join(names, " ")
+
+	return &SpotifyClient{
+		clientID:     clientID,
+		clientSecret: clientSecret,
+		refreshToken: refreshToken,
+		httpClient:   &http.Client{Timeout: httpClientTimeout},
+	}, nil
 }
 
-func loadData(filename string) (map[string]bool, error) {
-	data := make(map[string]bool)
+func newTelegramClient() (*TelegramClient, error) {
+	botToken := os.Getenv("BOT_TOKEN")
+	chatID := os.Getenv("CHAT_ID")
 
-	file, err := os.Open(filename)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return data, nil
-		}
-		return nil, err
-	}
-	defer file.Close()
-
-	if err := json.NewDecoder(file).Decode(&data); err != nil && err != io.EOF {
-		return nil, err
+	if botToken == "" || chatID == "" {
+		return nil, fmt.Errorf("missing required Telegram environment variables")
 	}
 
-	return data, nil
+	return &TelegramClient{
+		botToken:   botToken,
+		chatID:     chatID,
+		httpClient: &http.Client{Timeout: httpClientTimeout},
+	}, nil
 }
 
-func saveData(filename string, data map[string]bool) error {
-	file, err := os.Create(filename)
+func (c *SpotifyClient) getAccessToken(ctx context.Context) (string, error) {
+	data := url.Values{}
+	data.Set("grant_type", "refresh_token")
+	data.Set("refresh_token", c.refreshToken)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, spotifyTokenURL, strings.NewReader(data.Encode()))
 	if err != nil {
-		return err
-	}
-	defer file.Close()
-
-	return json.NewEncoder(file).Encode(data)
-}
-
-func getAccessToken() (string, error) {
-	form := url.Values{}
-	form.Add("grant_type", "refresh_token")
-	form.Add("refresh_token", os.Getenv("SPOTIFY_REFRESH_TOKEN"))
-
-	client := &http.Client{Timeout: 10 * time.Second}
-	req, err := http.NewRequest("POST", "https://accounts.spotify.com/api/token", strings.NewReader(form.Encode()))
-	if err != nil {
-		return "", err
+		return "", fmt.Errorf("error creating request: %w", err)
 	}
 
-	spotifyClientID := os.Getenv("SPOTIFY_CLIENT_ID")
-	spotifyClientSecret := os.Getenv("SPOTIFY_CLIENT_SECRET")
-
-	auth := fmt.Sprintf("%s:%s", spotifyClientID, spotifyClientSecret)
-	req.Header.Set("Authorization", fmt.Sprintf("Basic %s", b64.StdEncoding.EncodeToString([]byte(auth))))
+	auth := base64.StdEncoding.EncodeToString([]byte(c.clientID + ":" + c.clientSecret))
+	req.Header.Set("Authorization", "Basic "+auth)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-	resp, err := client.Do(req)
+	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("error sending request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("get access token request failed with status code %d: %s", resp.StatusCode, string(body))
+		return "", fmt.Errorf("unexpected status code %d: %s", resp.StatusCode, body)
 	}
 
-	var tokenResp SpotifyRefreshTokenResponse
+	var tokenResp SpotifyTokenResponse
 	if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
-		return "", err
+		return "", fmt.Errorf("error decoding response: %w", err)
 	}
 
 	return tokenResp.AccessToken, nil
 }
 
-func getCurrentPlaying() (Song, error) {
-	accessToken, err := getAccessToken()
+func (c *SpotifyClient) getCurrentTrack(ctx context.Context) (*Track, error) {
+	token, err := c.getAccessToken(ctx)
 	if err != nil {
-		return Song{}, fmt.Errorf("failed to get access token: %w", err)
+		return nil, fmt.Errorf("error getting access token: %w", err)
 	}
 
-	client := &http.Client{Timeout: 10 * time.Second}
-	req, err := http.NewRequest("GET", "https://api.spotify.com/v1/me/player/currently-playing", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, spotifyAPIBase+"/me/player/currently-playing", nil)
 	if err != nil {
-		return Song{}, err
+		return nil, fmt.Errorf("error creating request: %w", err)
 	}
-	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", accessToken))
+	req.Header.Set("Authorization", "Bearer "+token)
 
-	resp, err := client.Do(req)
+	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return Song{}, fmt.Errorf("failed to get current playing: %w", err)
+		return nil, fmt.Errorf("error sending request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusNoContent {
-		return Song{}, fmt.Errorf("not listening to music")
+		return nil, nil // No track currently playing
 	}
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return Song{}, fmt.Errorf("get current playing request failed with status code %d: %s", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("unexpected status code %d: %s", resp.StatusCode, body)
 	}
 
-	var song Song
-	if err := json.NewDecoder(resp.Body).Decode(&song); err != nil {
-		return Song{}, fmt.Errorf("failed to unmarshal response body: %w", err)
+	var response struct {
+		Item struct {
+			Name    string `json:"name"`
+			Artists []struct {
+				Name string `json:"name"`
+			} `json:"artists"`
+		} `json:"item"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
+		return nil, fmt.Errorf("error decoding response: %w", err)
 	}
 
-	return song, nil
-}
-
-func downloadFromYouTube(song, artists string) error {
-	cmd := exec.Command("yt-dlp", "-x", "--audio-format", "mp3", "--write-thumbnail", "-o", audioFile, "ytsearch1:"+fmt.Sprintf("%s %s", song, artists))
-	return cmd.Run()
-}
-
-func getThumbnail(filename string) (string, error) {
-	thumbnailFiles := []string{filename + ".jpg", filename + ".webp"}
-	for _, thumbnail := range thumbnailFiles {
-		if _, err := os.Stat(thumbnail); err == nil {
-			return thumbnail, nil
-		}
+	artists := make([]string, len(response.Item.Artists))
+	for i, artist := range response.Item.Artists {
+		artists[i] = artist.Name
 	}
-	return "", errors.New("thumbnail not found")
+
+	return &Track{
+		Name:    response.Item.Name,
+		Artists: artists,
+	}, nil
 }
 
-func sendAudio(token, chatID, filePath, title, performer, thumbnail string) error {
-	body := &bytes.Buffer{}
+func (t *TelegramClient) sendAudio(ctx context.Context, filePath, title, performer, thumbnail string) error {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return fmt.Errorf("error opening audio file: %w", err)
+	}
+	defer file.Close()
+
+	body := &strings.Builder{}
 	writer := multipart.NewWriter(body)
 
-	if err := addFileToWriter(writer, "audio", filePath); err != nil {
-		return err
+	part, err := writer.CreateFormFile("audio", filepath.Base(filePath))
+	if err != nil {
+		return fmt.Errorf("error creating form file: %w", err)
 	}
+	if _, err := io.Copy(part, file); err != nil {
+		return fmt.Errorf("error copying audio file: %w", err)
+	}
+
 	if thumbnail != "" {
-		if err := addFileToWriter(writer, "thumbnail", thumbnail); err != nil {
-			return err
+		thumbFile, err := os.Open(thumbnail)
+		if err != nil {
+			return fmt.Errorf("error opening thumbnail file: %w", err)
+		}
+		defer thumbFile.Close()
+
+		part, err := writer.CreateFormFile("thumbnail", filepath.Base(thumbnail))
+		if err != nil {
+			return fmt.Errorf("error creating thumbnail form file: %w", err)
+		}
+		if _, err := io.Copy(part, thumbFile); err != nil {
+			return fmt.Errorf("error copying thumbnail file: %w", err)
 		}
 	}
 
-	writer.WriteField("chat_id", chatID)
+	writer.WriteField("chat_id", t.chatID)
 	writer.WriteField("title", title)
 	writer.WriteField("performer", performer)
-	writer.Close()
 
-	req, err := http.NewRequest("POST", "https://api.telegram.org/bot"+token+"/sendAudio", body)
+	if err := writer.Close(); err != nil {
+		return fmt.Errorf("error closing multipart writer: %w", err)
+	}
+
+	url := fmt.Sprintf(telegramAPIBase, t.botToken)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, strings.NewReader(body.String()))
 	if err != nil {
-		return err
+		return fmt.Errorf("error creating request: %w", err)
 	}
 	req.Header.Set("Content-Type", writer.FormDataContentType())
 
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := t.httpClient.Do(req)
 	if err != nil {
-		return err
+		return fmt.Errorf("error sending request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("telegram api request failed with status %d: %s", resp.StatusCode, string(respBody))
-	}
-
-	if err := os.Remove(filePath); err != nil {
-		return err
-	}
-	if err := os.Remove(thumbnail); err != nil {
-		return err
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("unexpected status code %d: %s", resp.StatusCode, body)
 	}
 
 	return nil
 }
 
-func addFileToWriter(writer *multipart.Writer, fieldName, filePath string) error {
-	file, err := os.Open(filePath)
+func downloadFromYouTube(track *Track) error {
+	query := fmt.Sprintf("%s %s", track.Name, strings.Join(track.Artists, " "))
+	cmd := exec.Command("yt-dlp", "-x", "--audio-format", "mp3", "--write-thumbnail", "-o", audioFileName, "ytsearch1:"+query)
+	return cmd.Run()
+}
+
+func getThumbnail(filename string) (string, error) {
+	for _, ext := range thumbnailExtensions {
+		thumbnail := filename + ext
+		if _, err := os.Stat(thumbnail); err == nil {
+			return thumbnail, nil
+		}
+	}
+	return "", fmt.Errorf("thumbnail not found")
+}
+
+func loadTrackHistory(filename string) (TrackHistory, error) {
+	history := make(TrackHistory)
+
+	file, err := os.Open(filename)
 	if err != nil {
-		return err
+		if os.IsNotExist(err) {
+			return history, nil
+		}
+		return nil, fmt.Errorf("error opening file: %w", err)
 	}
 	defer file.Close()
 
-	part, err := writer.CreateFormFile(fieldName, filePath)
+	if err := json.NewDecoder(file).Decode(&history); err != nil && err != io.EOF {
+		return nil, fmt.Errorf("error decoding JSON: %w", err)
+	}
+
+	return history, nil
+}
+
+func saveTrackHistory(filename string, history TrackHistory) error {
+	file, err := os.Create(filename)
 	if err != nil {
-		return err
+		return fmt.Errorf("error creating file: %w", err)
 	}
-	if _, err := io.Copy(part, file); err != nil {
-		return err
+	defer file.Close()
+
+	if err := json.NewEncoder(file).Encode(history); err != nil {
+		return fmt.Errorf("error encoding JSON: %w", err)
 	}
+
+	return nil
+}
+
+func processCurrentTrack(spotifyClient *SpotifyClient, telegramClient *TelegramClient, history TrackHistory) error {
+	ctx := context.Background()
+
+	track, err := spotifyClient.getCurrentTrack(ctx)
+	if err != nil {
+		return fmt.Errorf("error getting current track: %w", err)
+	}
+	if track == nil {
+		log.Println("No track currently playing")
+		return nil
+	}
+
+	trackKey := fmt.Sprintf("%s - %s", track.Name, strings.Join(track.Artists, ", "))
+	log.Printf("Current track: %s", trackKey)
+
+	if history[trackKey] {
+		log.Printf("Track '%s' already processed. Skipping.", trackKey)
+		return nil
+	}
+
+	log.Printf("Downloading: %s", trackKey)
+	if err := downloadFromYouTube(track); err != nil {
+		return fmt.Errorf("error downloading from YouTube: %w", err)
+	}
+
+	thumbnail, err := getThumbnail(audioFileName)
+	if err != nil {
+		log.Printf("Error getting thumbnail: %v", err)
+	}
+
+	log.Printf("Uploading to Telegram: %s", trackKey)
+	if err := telegramClient.sendAudio(ctx, audioFileName, track.Name, strings.Join(track.Artists, ", "), thumbnail); err != nil {
+		return fmt.Errorf("error uploading to Telegram: %w", err)
+	}
+
+	history[trackKey] = true
+	if err := saveTrackHistory(dataFileName, history); err != nil {
+		log.Printf("Error saving track history: %v", err)
+	}
+
+	os.Remove(audioFileName)
+	if thumbnail != "" {
+		os.Remove(thumbnail)
+	}
+
 	return nil
 }
