@@ -6,6 +6,8 @@ services:
     container_name: wave
     image: wave
     restart: always
+    volumes:
+      - ./data.json:/app/data.json
     env_file:
       - .env
     environment:

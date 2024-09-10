@@ -16,6 +16,9 @@ FROM alpine:3.20 AS prod
 
 RUN apk add --no-cache yt-dlp
 
-COPY --from=builder /app/wave /wave
+COPY --from=builder /app/wave /app/wave
 
-ENTRYPOINT ["/wave"]
+WORKDIR /app
+
+ENTRYPOINT ["./wave"]
+
