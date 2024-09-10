@@ -41,9 +41,7 @@ var (
 )
 
 func main() {
-	if err := godotenv.Load(); err != nil {
-		log.Printf("No .env file found: %v", err)
-	}
+	_ = godotenv.Load()
 
 	upload := os.Getenv("UPLOAD")
 	chatID := os.Getenv("CHAT_ID")
@@ -52,53 +50,57 @@ func main() {
 		log.Fatal("required environment variables not set")
 	}
 
-	ticker := time.NewTicker(5 * time.Second)
+	ticker := time.NewTicker(60 * time.Second)
 	defer ticker.Stop()
 
 	for range ticker.C {
-		if err := processCurrentPlayingSong(botToken, chatID); err != nil {
+		if err := processCurrentPlayingSong(botToken, chatID, upload); err != nil {
 			log.Println(err)
 		}
 	}
 }
 
-func processCurrentPlayingSong(botToken, chatID string) error {
-	dataMap, err := loadData(dataFile)
-	if err != nil {
-		return fmt.Errorf("failed to load data: %w", err)
-	}
-
+func processCurrentPlayingSong(botToken, chatID, upload string) error {
 	song, err := getCurrentPlaying()
 	if err != nil {
-		return fmt.Errorf("failed to get current playing song: %w", err)
+		return err
 	}
 
 	artists := getArtists(song.Item.Artists)
 	songKey := fmt.Sprintf("%s - %s", song.Item.Name, artists)
 
-	if dataMap[songKey] {
-		log.Printf("Song '%s' already exists in the database. Skipping download.", songKey)
-		return nil
-	}
+	log.Println(songKey)
 
-	log.Printf("Downloading: %s", songKey)
-	if err := downloadFromYouTube(song.Item.Name, artists); err != nil {
-		return fmt.Errorf("failed to download from YouTube: %w", err)
-	}
+	if upload == "true" {
+		dataMap, err := loadData(dataFile)
+		if err != nil {
+			return fmt.Errorf("failed to load data: %w", err)
+		}
 
-	thumbnail, err := getThumbnail(audioFile)
-	if err != nil {
-		log.Printf("failed to get thumbnail: %v", err)
-	}
+		if dataMap[songKey] {
+			log.Printf("Song '%s' already exists in the database. Skipping download.", songKey)
+			return nil
+		}
 
-	log.Printf("Uploading to Telegram: %s", songKey)
-	if err := sendAudio(botToken, chatID, audioFile, song.Item.Name, artists, thumbnail); err != nil {
-		return fmt.Errorf("failed to upload to Telegram: %w", err)
-	}
+		log.Printf("Downloading: %s", songKey)
+		if err := downloadFromYouTube(song.Item.Name, artists); err != nil {
+			return fmt.Errorf("failed to download from YouTube: %w", err)
+		}
 
-	dataMap[songKey] = true
-	if err := saveData(dataFile, dataMap); err != nil {
-		log.Printf("failed to save data: %v", err)
+		thumbnail, err := getThumbnail(audioFile)
+		if err != nil {
+			log.Printf("failed to get thumbnail: %v", err)
+		}
+
+		log.Printf("Uploading to Telegram: %s", songKey)
+		if err := sendAudio(botToken, chatID, audioFile, song.Item.Name, artists, thumbnail); err != nil {
+			return fmt.Errorf("failed to upload to Telegram: %w", err)
+		}
+
+		dataMap[songKey] = true
+		if err := saveData(dataFile, dataMap); err != nil {
+			log.Printf("failed to save data: %v", err)
+		}
 	}
 
 	return nil
