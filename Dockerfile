@@ -1,6 +1,4 @@
-FROM golang:1.23.0-alpine AS builder
-
-ARG APP
+FROM golang:1.22.5-alpine3.20 AS builder
 
 WORKDIR /app
 
@@ -10,7 +8,7 @@ RUN go mod download && go mod verify
 
 COPY . .
 
-RUN CGO_ENABLED=0 GOARCH=amd64 GOOS=linux go build -o wave -a -ldflags="-s -w" -installsuffix cgo ${APP}
+RUN CGO_ENABLED=0 GOARCH=amd64 GOOS=linux go build -o wave -a -ldflags="-s -w"
 
 FROM alpine:3.20 AS prod
 
@@ -21,4 +19,3 @@ COPY --from=builder /app/wave /app/wave
 WORKDIR /app
 
 ENTRYPOINT ["./wave"]
-

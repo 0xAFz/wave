@@ -5,15 +5,9 @@ services:
       dockerfile: Dockerfile
     container_name: wave
     image: wave
-    restart: always
-    volumes:
-      - ./data.json:/app/data.json
     env_file:
       - .env
-    environment:
-      - SPOTIFY_CLIENT_ID=${SPOTIFY_CLIENT_ID}
-      - SPOTIFY_CLIENT_SECRET=${SPOTIFY_CLIENT_SECRET}
-      - SPOTIFY_REFRESH_TOKEN=${SPOTIFY_REFRESH_TOKEN}
-      - BOT_TOKEN=${BOT_TOKEN}
-      - UPLOAD=${UPLOAD}
-      - CHAT_ID=${CHAT_ID}
+    deploy:
+      restart_policy:
+        condition: on-failure
+        delay: 5s
