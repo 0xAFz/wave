@@ -22,15 +22,10 @@ import (
 const (
 	spotifyAPIBase    = "https://api.spotify.com/v1"
 	spotifyTokenURL   = "https://accounts.spotify.com/api/token"
-	telegramAPIBase   = "https://api.telegram.org/bot%s/sendAudio"
-	refreshInterval   = 60 * time.Second
+	telegramAPIBase   = "https://api.telegram.org/bot%s/%s"
+	refreshInterval   = 120 * time.Second
 	httpClientTimeout = 10 * time.Second
 	audioFileName     = "audio.mp3"
-	dataFileName      = "data.json"
-)
-
-var (
-	thumbnailExtensions = [2]string{".jpg", ".webp"}
 )
 
 type (
@@ -44,6 +39,7 @@ type (
 	TelegramClient struct {
 		botToken   string
 		chatID     string
+		messageID  *int
 		httpClient *http.Client
 	}
 
@@ -58,8 +54,6 @@ type (
 		ExpiresIn   int    `json:"expires_in"`
 		Scope       string `json:"scope"`
 	}
-
-	TrackHistory map[string]bool
 )
 
 func main() {
@@ -73,24 +67,19 @@ func run() error {
 
 	spotifyClient, err := newSpotifyClient()
 	if err != nil {
-		return fmt.Errorf("error creating Spotify client: %w", err)
+		return fmt.Errorf("error creating spotify client: %w", err)
 	}
 
 	telegramClient, err := newTelegramClient()
 	if err != nil {
-		return fmt.Errorf("error creating Telegram client: %w", err)
-	}
-
-	history, err := loadTrackHistory(dataFileName)
-	if err != nil {
-		return fmt.Errorf("error loading track history: %w", err)
+		return fmt.Errorf("error creating telegram client: %w", err)
 	}
 
 	ticker := time.NewTicker(refreshInterval)
 	defer ticker.Stop()
 
 	for range ticker.C {
-		if err := processCurrentTrack(spotifyClient, telegramClient, history); err != nil {
+		if err := processCurrentTrack(spotifyClient, telegramClient); err != nil {
 			log.Printf("Error processing current track: %v", err)
 		}
 	}
@@ -104,7 +93,7 @@ func newSpotifyClient() (*SpotifyClient, error) {
 	refreshToken := os.Getenv("SPOTIFY_REFRESH_TOKEN")
 
 	if clientID == "" || clientSecret == "" || refreshToken == "" {
-		return nil, fmt.Errorf("missing required Spotify environment variables")
+		return nil, fmt.Errorf("missing required spotify environment variables")
 	}
 
 	return &SpotifyClient{
@@ -120,7 +109,7 @@ func newTelegramClient() (*TelegramClient, error) {
 	chatID := os.Getenv("CHAT_ID")
 
 	if botToken == "" || chatID == "" {
-		return nil, fmt.Errorf("missing required Telegram environment variables")
+		return nil, fmt.Errorf("missing required telegram environment variables")
 	}
 
 	return &TelegramClient{
@@ -212,7 +201,7 @@ func (c *SpotifyClient) getCurrentTrack(ctx context.Context) (*Track, error) {
 	}, nil
 }
 
-func (t *TelegramClient) sendAudio(ctx context.Context, filePath, title, performer, thumbnail string) error {
+func (t *TelegramClient) sendOrEditAudio(ctx context.Context, filePath, title, performer, thumbnail string) error {
 	file, err := os.Open(filePath)
 	if err != nil {
 		return fmt.Errorf("error opening audio file: %w", err)
@@ -221,6 +210,20 @@ func (t *TelegramClient) sendAudio(ctx context.Context, filePath, title, perform
 
 	body := &strings.Builder{}
 	writer := multipart.NewWriter(body)
+
+	writer.WriteField("chat_id", t.chatID)
+
+	url := fmt.Sprintf(telegramAPIBase, t.botToken, "sendAudio")
+
+	if t.messageID != nil {
+		url = fmt.Sprintf(telegramAPIBase, t.botToken, "editMessageMedia")
+		writer.WriteField("message_id", fmt.Sprintf("%d", *t.messageID))
+		media := fmt.Sprintf(`{"type":"audio","media":"attach://audio", "thumbnail":"attach://thumbnail", "title":"%s", "performer":"%s"}`, title, performer)
+		writer.WriteField("media", media)
+	} else {
+		writer.WriteField("title", title)
+		writer.WriteField("performer", performer)
+	}
 
 	part, err := writer.CreateFormFile("audio", filepath.Base(filePath))
 	if err != nil {
@@ -246,15 +249,10 @@ func (t *TelegramClient) sendAudio(ctx context.Context, filePath, title, perform
 		}
 	}
 
-	writer.WriteField("chat_id", t.chatID)
-	writer.WriteField("title", title)
-	writer.WriteField("performer", performer)
-
 	if err := writer.Close(); err != nil {
 		return fmt.Errorf("error closing multipart writer: %w", err)
 	}
 
-	url := fmt.Sprintf(telegramAPIBase, t.botToken)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, strings.NewReader(body.String()))
 	if err != nil {
 		return fmt.Errorf("error creating request: %w", err)
@@ -272,62 +270,47 @@ func (t *TelegramClient) sendAudio(ctx context.Context, filePath, title, perform
 		return fmt.Errorf("unexpected status code %d: %s", resp.StatusCode, body)
 	}
 
+	var respData struct {
+		Ok     bool `json:"ok"`
+		Result struct {
+			MessageID int `json:"message_id"`
+		} `json:"result"`
+		Description string `json:"description,omitempty"`
+		ErrorCode   int    `json:"error_code,omitempty"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&respData); err != nil {
+		return fmt.Errorf("failed to decode message_id: %w", err)
+	}
+
+	if !respData.Ok {
+		return fmt.Errorf("request failed: %s (error code: %d)", respData.Description, respData.ErrorCode)
+	}
+
+	t.messageID = &respData.Result.MessageID
+
 	return nil
 }
 
 func downloadFromYouTube(track *Track) error {
 	query := fmt.Sprintf("%s %s", track.Name, strings.Join(track.Artists, " "))
-	cmd := exec.Command("yt-dlp", "-x", "--audio-format", "mp3", "--write-thumbnail", "-o", audioFileName, "ytsearch1:"+query)
+	cmd := exec.Command("yt-dlp", "-x", "--audio-format", "mp3", "--write-thumbnail", "--convert-thumbnails", "jpg", "-o", audioFileName, "ytsearch1:"+query)
 	return cmd.Run()
 }
 
 func getThumbnail(filename string) (string, error) {
-	for _, ext := range thumbnailExtensions {
-		thumbnail := filename + ext
-		if _, err := os.Stat(thumbnail); err == nil {
-			return thumbnail, nil
-		}
+	thumbnail := filename + ".jpg"
+	if _, err := os.Stat(thumbnail); err == nil {
+		return thumbnail, nil
 	}
 	return "", fmt.Errorf("thumbnail not found")
 }
 
-func loadTrackHistory(filename string) (TrackHistory, error) {
-	history := make(TrackHistory)
+func processCurrentTrack(spotifyClient *SpotifyClient, telegramClient *TelegramClient) error {
+	getCurrentCtx, cancel := context.WithTimeout(context.Background(), time.Second*10)
+	defer cancel()
 
-	file, err := os.Open(filename)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return history, nil
-		}
-		return nil, fmt.Errorf("error opening file: %w", err)
-	}
-	defer file.Close()
-
-	if err := json.NewDecoder(file).Decode(&history); err != nil && err != io.EOF {
-		return nil, fmt.Errorf("error decoding JSON: %w", err)
-	}
-
-	return history, nil
-}
-
-func saveTrackHistory(filename string, history TrackHistory) error {
-	file, err := os.Create(filename)
-	if err != nil {
-		return fmt.Errorf("error creating file: %w", err)
-	}
-	defer file.Close()
-
-	if err := json.NewEncoder(file).Encode(history); err != nil {
-		return fmt.Errorf("error encoding JSON: %w", err)
-	}
-
-	return nil
-}
-
-func processCurrentTrack(spotifyClient *SpotifyClient, telegramClient *TelegramClient, history TrackHistory) error {
-	ctx := context.Background()
-
-	track, err := spotifyClient.getCurrentTrack(ctx)
+	track, err := spotifyClient.getCurrentTrack(getCurrentCtx)
 	if err != nil {
 		return fmt.Errorf("error getting current track: %w", err)
 	}
@@ -339,14 +322,9 @@ func processCurrentTrack(spotifyClient *SpotifyClient, telegramClient *TelegramC
 	trackKey := fmt.Sprintf("%s - %s", track.Name, strings.Join(track.Artists, ", "))
 	log.Printf("Current track: %s", trackKey)
 
-	if history[trackKey] {
-		log.Printf("Track '%s' already processed. Skipping.", trackKey)
-		return nil
-	}
-
 	log.Printf("Downloading: %s", trackKey)
 	if err := downloadFromYouTube(track); err != nil {
-		return fmt.Errorf("error downloading from YouTube: %w", err)
+		return fmt.Errorf("error downloading from youtube: %w", err)
 	}
 
 	thumbnail, err := getThumbnail(audioFileName)
@@ -354,14 +332,12 @@ func processCurrentTrack(spotifyClient *SpotifyClient, telegramClient *TelegramC
 		log.Printf("Error getting thumbnail: %v", err)
 	}
 
-	log.Printf("Uploading to Telegram: %s", trackKey)
-	if err := telegramClient.sendAudio(ctx, audioFileName, track.Name, strings.Join(track.Artists, ", "), thumbnail); err != nil {
-		return fmt.Errorf("error uploading to Telegram: %w", err)
-	}
+	sendCtx, cancel := context.WithTimeout(context.Background(), time.Minute*2)
+	defer cancel()
 
-	history[trackKey] = true
-	if err := saveTrackHistory(dataFileName, history); err != nil {
-		log.Printf("Error saving track history: %v", err)
+	log.Printf("Uploading to Telegram: %s", trackKey)
+	if err := telegramClient.sendOrEditAudio(sendCtx, audioFileName, track.Name, strings.Join(track.Artists, ", "), thumbnail); err != nil {
+		return fmt.Errorf("error uploading to telegram: %w", err)
 	}
 
 	os.Remove(audioFileName)
