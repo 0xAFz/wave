@@ -1,9 +1,18 @@
 # Wave
-Shows your current listening music from spotify
+
+Send your currently playing Spotify tracks directly to Telegram. The bot automatically handles message updates to avoid spam.
+
+## Features
+- 🎵 Share current Spotify tracks to Telegram
+- 🔄 Auto-updates existing messages instead of creating new ones
+- 🎧 Sends audio file if track not previously shared
+- ⚡ Simple and lightweight
 
 ## Running Steps
 
 ### Requirements
+- Spotify API credentials
+- Telegram Bot Token
 - [Docker](https://www.docker.com/) and [Docker Compose](https://docs.docker.com/compose/) plugin
 
 To run this app, we have several steps that we need to do in order:
