@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -23,17 +24,17 @@ const (
 	spotifyAPIBase    = "https://api.spotify.com/v1"
 	spotifyTokenURL   = "https://accounts.spotify.com/api/token"
 	telegramAPIBase   = "https://api.telegram.org/bot%s/%s"
-	refreshInterval   = 120 * time.Second
 	httpClientTimeout = 10 * time.Second
 	audioFileName     = "audio.mp3"
 )
 
 type (
 	SpotifyClient struct {
-		clientID     string
-		clientSecret string
-		refreshToken string
-		httpClient   *http.Client
+		clientID        string
+		clientSecret    string
+		refreshToken    string
+		httpClient      *http.Client
+		refreshInterval time.Duration
 	}
 
 	TelegramClient struct {
@@ -75,7 +76,7 @@ func run() error {
 		return fmt.Errorf("error creating telegram client: %w", err)
 	}
 
-	ticker := time.NewTicker(refreshInterval)
+	ticker := time.NewTicker(spotifyClient.refreshInterval)
 	defer ticker.Stop()
 
 	for range ticker.C {
@@ -91,16 +92,25 @@ func newSpotifyClient() (*SpotifyClient, error) {
 	clientID := os.Getenv("SPOTIFY_CLIENT_ID")
 	clientSecret := os.Getenv("SPOTIFY_CLIENT_SECRET")
 	refreshToken := os.Getenv("SPOTIFY_REFRESH_TOKEN")
+	refreshIntervalStr := os.Getenv("REFRESH_INTERVAL")
 
-	if clientID == "" || clientSecret == "" || refreshToken == "" {
+	if clientID == "" || clientSecret == "" || refreshToken == "" || refreshIntervalStr == "" {
 		return nil, fmt.Errorf("missing required spotify environment variables")
 	}
 
+	refreshIntervalInt, err := strconv.Atoi(refreshIntervalStr)
+	if err != nil {
+		return nil, fmt.Errorf("invalid refresh interval value")
+	}
+
+	refreshInterval := time.Duration(refreshIntervalInt) * time.Second
+
 	return &SpotifyClient{
-		clientID:     clientID,
-		clientSecret: clientSecret,
-		refreshToken: refreshToken,
-		httpClient:   &http.Client{Timeout: httpClientTimeout},
+		clientID:        clientID,
+		clientSecret:    clientSecret,
+		refreshToken:    refreshToken,
+		httpClient:      &http.Client{Timeout: httpClientTimeout},
+		refreshInterval: refreshInterval,
 	}, nil
 }
 
